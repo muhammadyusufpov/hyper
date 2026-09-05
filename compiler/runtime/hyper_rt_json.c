@@ -36,18 +36,15 @@ typedef struct {
     RtDictEntry *entries;
     size_t len;
     size_t cap;
+    /* Hash index lives in hyper_rt.c; dump only walks `entries` in insert order. */
+    int32_t *slots;
+    size_t nslots;
 } RtDict;
 
 extern int64_t hyper_rt_list_new(void);
 extern void hyper_rt_list_push(int64_t list, int64_t value, int64_t kind);
 extern int64_t hyper_rt_dict_new(void);
-extern void hyper_rt_dict_push(
-    int64_t dict,
-    int64_t key,
-    int64_t key_kind,
-    int64_t val,
-    int64_t val_kind
-);
+extern void hyper_rt_dict_push(int64_t dict, int64_t key, int64_t key_kind, int64_t val, int64_t val_kind);
 extern int64_t hyper_rt_file_read_all(
     int64_t handle,
     int64_t handle_kind,

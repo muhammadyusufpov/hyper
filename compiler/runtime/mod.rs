@@ -1,4 +1,5 @@
 use crate::error;
+use indexmap::IndexMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -26,9 +27,7 @@ pub use file::{
     hyper_rt_file_tell, hyper_rt_file_write, hyper_rt_file_writelines,
 };
 pub use io::hyper_rt_input;
-pub use json::{
-    hyper_rt_json_dump, hyper_rt_json_dumps, hyper_rt_json_load, hyper_rt_json_loads,
-};
+pub use json::{hyper_rt_json_dump, hyper_rt_json_dumps, hyper_rt_json_load, hyper_rt_json_loads};
 pub use mmap::{hyper_rt_mmap_close, hyper_rt_mmap_open, hyper_rt_mmap_read_chunk};
 pub use str::{
     hyper_rt_str_capitalize, hyper_rt_str_center, hyper_rt_str_count, hyper_rt_str_endswith,
@@ -52,8 +51,11 @@ pub(crate) struct RtList {
     items: Vec<RtValue>,
 }
 
+/// Insertion-order map: `IndexMap` so print / `keys()` / JSON stay stable, with
+/// amortized O(1) get/set. The AOT runtime (`hyper_rt.c`) uses the same order
+/// plus an open-addressing index; ABI (`hyper_rt_dict_*`) is unchanged.
 pub(crate) struct RtDict {
-    entries: Vec<(String, RtValue)>,
+    entries: IndexMap<String, RtValue>,
 }
 
 struct RtStruct {
@@ -123,6 +125,14 @@ fn format_dict(dict: &RtDict) -> String {
     }
     out.push('}');
     out
+}
+
+fn dict_own_key(key: i64, key_kind: i64, owned: String) -> String {
+    if key_kind == KIND_STR {
+        key_to_string(key, key_kind)
+    } else {
+        owned
+    }
 }
 
 fn format_struct(st: &RtStruct) -> String {
@@ -321,31 +331,25 @@ pub extern "C" fn hyper_rt_print_list(list: i64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn hyper_rt_dict_new() -> i64 {
     let dict = Box::new(RtDict {
-        entries: Vec::new(),
+        entries: IndexMap::new(),
     });
     Box::into_raw(dict) as i64
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hyper_rt_dict_push(
-    dict: i64,
-    key: i64,
-    key_kind: i64,
-    val: i64,
-    val_kind: i64,
-) {
+pub extern "C" fn hyper_rt_dict_push(dict: i64, key: i64, key_kind: i64, val: i64, val_kind: i64) {
     if dict == 0 {
         return;
     }
     let dict = unsafe { &mut *(dict as *mut RtDict) };
     let k = key_to_string(key, key_kind);
-    dict.entries.push((
-        k,
-        RtValue {
-            kind: val_kind,
-            payload: val,
-        },
-    ));
+    let next = RtValue {
+        kind: val_kind,
+        payload: val,
+    };
+    if let Some(old) = dict.entries.insert(k, next) {
+        free_rt_value(old);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -402,25 +406,18 @@ pub extern "C" fn hyper_rt_list_set(list: i64, index: i64, value: i64, kind: i64
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hyper_rt_dict_get(
-    dict: i64,
-    key: i64,
-    key_kind: i64,
-    out_kind: *mut i64,
-) -> i64 {
+pub extern "C" fn hyper_rt_dict_get(dict: i64, key: i64, key_kind: i64, out_kind: *mut i64) -> i64 {
     if dict == 0 || out_kind.is_null() {
         return 0;
     }
     let dict = unsafe { &*(dict as *const RtDict) };
     let mut owned = String::new();
     let k = key_as_str(key, key_kind, &mut owned);
-    for (ek, ev) in &dict.entries {
-        if ek == k {
-            unsafe {
-                *out_kind = ev.kind;
-            }
-            return ev.payload;
+    if let Some(ev) = dict.entries.get(k) {
+        unsafe {
+            *out_kind = ev.kind;
         }
+        return ev.payload;
     }
     unsafe {
         *out_kind = KIND_NONE;
@@ -429,56 +426,35 @@ pub extern "C" fn hyper_rt_dict_get(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hyper_rt_dict_set(
-    dict: i64,
-    key: i64,
-    key_kind: i64,
-    value: i64,
-    val_kind: i64,
-) {
+pub extern "C" fn hyper_rt_dict_set(dict: i64, key: i64, key_kind: i64, value: i64, val_kind: i64) {
     if dict == 0 {
         return;
     }
     let dict = unsafe { &mut *(dict as *mut RtDict) };
     let mut owned = String::new();
     let k = key_as_str(key, key_kind, &mut owned);
-    for (ek, ev) in &mut dict.entries {
-        if ek == k {
-            let old = std::mem::replace(
-                ev,
-                RtValue {
-                    kind: val_kind,
-                    payload: value,
-                },
-            );
-            free_rt_value(old);
-            return;
-        }
+    if let Some(ev) = dict.entries.get_mut(k) {
+        let old = std::mem::replace(
+            ev,
+            RtValue {
+                kind: val_kind,
+                payload: value,
+            },
+        );
+        free_rt_value(old);
+        return;
     }
-    let key_owned = if owned.is_empty() && key_kind == KIND_STR {
-        key_to_string(key, key_kind)
-    } else if !owned.is_empty() {
-        std::mem::take(&mut owned)
-    } else {
-        key_to_string(key, key_kind)
-    };
-    dict.entries.push((
-        key_owned,
+    dict.entries.insert(
+        dict_own_key(key, key_kind, owned),
         RtValue {
             kind: val_kind,
             payload: value,
         },
-    ));
+    );
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hyper_rt_index_get(
-    obj: i64,
-    obj_kind: i64,
-    idx: i64,
-    idx_kind: i64,
-    out_kind: *mut i64,
-) -> i64 {
+pub extern "C" fn hyper_rt_index_get(obj: i64, obj_kind: i64, idx: i64, idx_kind: i64, out_kind: *mut i64) -> i64 {
     if obj_kind == KIND_DICT {
         hyper_rt_dict_get(obj, idx, idx_kind, out_kind)
     } else if obj_kind == KIND_LIST {
@@ -494,14 +470,7 @@ pub extern "C" fn hyper_rt_index_get(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn hyper_rt_index_set(
-    obj: i64,
-    obj_kind: i64,
-    idx: i64,
-    idx_kind: i64,
-    value: i64,
-    val_kind: i64,
-) {
+pub extern "C" fn hyper_rt_index_set(obj: i64, obj_kind: i64, idx: i64, idx_kind: i64, value: i64, val_kind: i64) {
     if obj_kind == KIND_DICT {
         hyper_rt_dict_set(obj, idx, idx_kind, value, val_kind);
     } else if obj_kind == KIND_LIST {
@@ -549,14 +518,7 @@ pub extern "C" fn hyper_rt_coll_len(payload: i64, kind: i64, line: i64, _line_ki
 
 /// `append(x)` on a list or array. Mutates the handle in place.
 #[unsafe(no_mangle)]
-pub extern "C" fn hyper_rt_coll_append(
-    payload: i64,
-    kind: i64,
-    value: i64,
-    val_kind: i64,
-    line: i64,
-    _line_kind: i64,
-) {
+pub extern "C" fn hyper_rt_coll_append(payload: i64, kind: i64, value: i64, val_kind: i64, line: i64, _line_kind: i64) {
     if kind == KIND_LIST {
         hyper_rt_list_push(payload, value, val_kind);
         return;
@@ -637,7 +599,9 @@ fn values_equal(a: &RtValue, b: &RtValue) -> bool {
         (KIND_STR, KIND_STR) => cstr_to_str(a.payload) == cstr_to_str(b.payload),
         (KIND_NONE, KIND_NONE) => true,
         (KIND_BOOL, KIND_BOOL) => a.payload == b.payload,
-        (KIND_F64, KIND_F64) => f64::from_bits(a.payload as u64) == f64::from_bits(b.payload as u64),
+        (KIND_F64, KIND_F64) => {
+            f64::from_bits(a.payload as u64) == f64::from_bits(b.payload as u64)
+        }
         (KIND_F64, KIND_I64) => f64::from_bits(a.payload as u64) == b.payload as f64,
         (KIND_I64, KIND_F64) => a.payload as f64 == f64::from_bits(b.payload as u64),
         (KIND_I64, KIND_I64) => a.payload == b.payload,
@@ -664,8 +628,8 @@ fn values_equal(a: &RtValue, b: &RtValue) -> bool {
                 && left.entries.iter().all(|(key, value)| {
                     right
                         .entries
-                        .iter()
-                        .any(|(other_key, other)| other_key == key && values_equal(value, other))
+                        .get(key)
+                        .is_some_and(|other| values_equal(value, other))
                 })
         }
         _ => false,
@@ -703,10 +667,7 @@ pub extern "C" fn hyper_rt_handle_leave() -> i64 {
 /// message and returns so the caller can take the fallback branch.
 #[unsafe(no_mangle)]
 pub extern "C" fn hyper_rt_raise(payload: i64, kind: i64, line: i64, _line_kind: i64) -> i64 {
-    let msg = format_value(&RtValue {
-        kind,
-        payload,
-    });
+    let msg = format_value(&RtValue { kind, payload });
     let depth = HANDLE_DEPTH.with(|d| d.get());
     if depth > 0 {
         PENDING_RAISE.with(|cell| {
@@ -871,7 +832,10 @@ mod tests {
     fn integers_and_floats_compare_numerically() {
         let one = 1i64;
         let one_point_zero = 1.0f64.to_bits() as i64;
-        assert_eq!(hyper_rt_value_eq(one, KIND_I64, one_point_zero, KIND_F64), 1);
+        assert_eq!(
+            hyper_rt_value_eq(one, KIND_I64, one_point_zero, KIND_F64),
+            1
+        );
         assert_eq!(hyper_rt_value_eq(2, KIND_I64, one_point_zero, KIND_F64), 0);
     }
 
@@ -891,5 +855,59 @@ mod tests {
     fn none_equals_none_only() {
         assert_eq!(hyper_rt_value_eq(0, KIND_NONE, 0, KIND_NONE), 1);
         assert_eq!(hyper_rt_value_eq(0, KIND_NONE, 0, KIND_I64), 0);
+    }
+
+    #[test]
+    fn dict_get_set_overwrite_keeps_insertion_order() {
+        let dict = hyper_rt_dict_new();
+        hyper_rt_dict_push(dict, str_payload("a"), KIND_STR, 1, KIND_I64);
+        hyper_rt_dict_push(dict, str_payload("b"), KIND_STR, 2, KIND_I64);
+        hyper_rt_dict_set(dict, str_payload("a"), KIND_STR, 9, KIND_I64);
+        let mut kind = KIND_NONE;
+        assert_eq!(
+            hyper_rt_dict_get(dict, str_payload("a"), KIND_STR, &mut kind),
+            9
+        );
+        assert_eq!(kind, KIND_I64);
+        let keys = hyper_rt_coll_keys(dict, KIND_DICT, 1, 0);
+        let mut kkind = KIND_NONE;
+        let first = hyper_rt_list_get(keys, 0, &mut kkind);
+        assert_eq!(cstr_to_str(first), "a");
+        let second = hyper_rt_list_get(keys, 1, &mut kkind);
+        assert_eq!(cstr_to_str(second), "b");
+        assert_eq!(
+            hyper_rt_dict_get(dict, str_payload("missing"), KIND_STR, &mut kind),
+            0
+        );
+        assert_eq!(kind, KIND_NONE);
+    }
+
+    /// Amortized O(1) get/set: 256 keys, then ~1e6 lookups on interned key pointers.
+    /// Linear scan at this size is tens of times slower in debug builds.
+    #[test]
+    fn dict_get_set_on_medium_map() {
+        const N: i64 = 256;
+        let dict = hyper_rt_dict_new();
+        let keys: Vec<i64> = (0..N).map(|i| str_payload(&format!("k{i}"))).collect();
+        for (i, &key) in keys.iter().enumerate() {
+            hyper_rt_dict_set(dict, key, KIND_STR, i as i64, KIND_I64);
+        }
+        assert_eq!(hyper_rt_coll_len(dict, KIND_DICT, 1, 0), N);
+
+        let mut kind = KIND_NONE;
+        let start = std::time::Instant::now();
+        for _ in 0..4096 {
+            for (i, &key) in keys.iter().enumerate() {
+                assert_eq!(hyper_rt_dict_get(dict, key, KIND_STR, &mut kind), i as i64);
+                assert_eq!(kind, KIND_I64);
+            }
+        }
+        let elapsed = start.elapsed();
+        hyper_rt_dict_set(dict, keys[0], KIND_STR, 999, KIND_I64);
+        assert_eq!(hyper_rt_dict_get(dict, keys[0], KIND_STR, &mut kind), 999);
+        assert!(
+            elapsed.as_millis() < 1500,
+            "medium dict get should be hash-backed, took {elapsed:?}"
+        );
     }
 }

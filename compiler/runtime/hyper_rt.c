@@ -40,11 +40,111 @@ typedef struct {
     RtValue value;
 } RtDictEntry;
 
+/* Insertion-order entries plus open-addressing index (same ABI as JIT IndexMap). */
+#define DICT_EMPTY (-1)
+
 typedef struct {
     RtDictEntry *entries;
     size_t len;
     size_t cap;
+    int32_t *slots;
+    size_t nslots;
 } RtDict;
+
+static uint64_t dict_hash(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    const unsigned char *p = (const unsigned char *)(s ? s : "");
+    while (*p) {
+        h ^= *p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static const char *dict_key_cstr(const char *key) {
+    return key ? key : "";
+}
+
+static int dict_rehash(RtDict *dict, size_t nslots) {
+    int32_t *slots = (int32_t *)malloc(nslots * sizeof(int32_t));
+    if (!slots) {
+        return 0;
+    }
+    for (size_t i = 0; i < nslots; i++) {
+        slots[i] = DICT_EMPTY;
+    }
+    uint64_t mask = (uint64_t)nslots - 1;
+    for (size_t i = 0; i < dict->len; i++) {
+        uint64_t h = dict_hash(dict_key_cstr(dict->entries[i].key));
+        for (;;) {
+            size_t slot = (size_t)(h & mask);
+            if (slots[slot] == DICT_EMPTY) {
+                slots[slot] = (int32_t)i;
+                break;
+            }
+            h++;
+        }
+    }
+    free(dict->slots);
+    dict->slots = slots;
+    dict->nslots = nslots;
+    return 1;
+}
+
+static int32_t dict_lookup(const RtDict *dict, const char *k) {
+    if (!dict->nslots) {
+        return DICT_EMPTY;
+    }
+    const char *want = dict_key_cstr(k);
+    uint64_t mask = (uint64_t)dict->nslots - 1;
+    uint64_t h = dict_hash(want);
+    for (size_t i = 0; i < dict->nslots; i++) {
+        size_t slot = (size_t)(h & mask);
+        int32_t idx = dict->slots[slot];
+        if (idx == DICT_EMPTY) {
+            return DICT_EMPTY;
+        }
+        if (strcmp(dict_key_cstr(dict->entries[idx].key), want) == 0) {
+            return idx;
+        }
+        h++;
+    }
+    return DICT_EMPTY;
+}
+
+static int dict_index_new_entry(RtDict *dict) {
+    if (!dict->nslots || dict->len * 4 > dict->nslots * 3) {
+        size_t nslots = dict->nslots ? dict->nslots * 2 : 8;
+        while (dict->len * 4 > nslots * 3) {
+            nslots *= 2;
+        }
+        return dict_rehash(dict, nslots);
+    }
+    int32_t idx = (int32_t)(dict->len - 1);
+    uint64_t mask = (uint64_t)dict->nslots - 1;
+    uint64_t h = dict_hash(dict_key_cstr(dict->entries[idx].key));
+    for (;;) {
+        size_t slot = (size_t)(h & mask);
+        if (dict->slots[slot] == DICT_EMPTY) {
+            dict->slots[slot] = idx;
+            return 1;
+        }
+        h++;
+    }
+}
+
+static int dict_grow_entries(RtDict *dict) {
+    if (dict->len + 1 > dict->cap) {
+        size_t ncap = dict->cap ? dict->cap * 2 : 4;
+        RtDictEntry *ne = (RtDictEntry *)realloc(dict->entries, ncap * sizeof(RtDictEntry));
+        if (!ne) {
+            return 0;
+        }
+        dict->entries = ne;
+        dict->cap = ncap;
+    }
+    return 1;
+}
 
 typedef struct {
     RtValue *fields;
@@ -73,6 +173,7 @@ static void free_rt_dict(RtDict *dict) {
         free_rt_value(dict->entries[i].value);
     }
     free(dict->entries);
+    free(dict->slots);
     free(dict);
 }
 
@@ -428,30 +529,10 @@ static char *key_to_string(int64_t key, int64_t key_kind) {
     return out;
 }
 
-void hyper_rt_dict_push(
-    int64_t dict_h,
-    int64_t key,
-    int64_t key_kind,
-    int64_t val,
-    int64_t val_kind
-) {
-    if (!dict_h) {
-        return;
-    }
-    RtDict *dict = (RtDict *)(intptr_t)dict_h;
-    if (dict->len + 1 > dict->cap) {
-        size_t ncap = dict->cap ? dict->cap * 2 : 4;
-        RtDictEntry *ne = (RtDictEntry *)realloc(dict->entries, ncap * sizeof(RtDictEntry));
-        if (!ne) {
-            return;
-        }
-        dict->entries = ne;
-        dict->cap = ncap;
-    }
-    dict->entries[dict->len].key = key_to_string(key, key_kind);
-    dict->entries[dict->len].value.kind = val_kind;
-    dict->entries[dict->len].value.payload = val;
-    dict->len++;
+void hyper_rt_dict_set(int64_t dict_h, int64_t key, int64_t key_kind, int64_t value, int64_t val_kind);
+
+void hyper_rt_dict_push(int64_t dict_h, int64_t key, int64_t key_kind, int64_t val, int64_t val_kind) {
+    hyper_rt_dict_set(dict_h, key, key_kind, val, val_kind);
 }
 
 void hyper_rt_print_dict(int64_t dict_h) {
@@ -495,12 +576,7 @@ void hyper_rt_list_set(int64_t list_h, int64_t index, int64_t value, int64_t kin
     list->items[index].payload = value;
 }
 
-int64_t hyper_rt_dict_get(
-    int64_t dict_h,
-    int64_t key,
-    int64_t key_kind,
-    int64_t *out_kind
-) {
+int64_t hyper_rt_dict_get(int64_t dict_h, int64_t key, int64_t key_kind, int64_t *out_kind) {
     if (!dict_h || !out_kind) {
         return 0;
     }
@@ -518,25 +594,17 @@ int64_t hyper_rt_dict_get(
         }
         k = owned;
     }
-    for (size_t i = 0; i < dict->len; i++) {
-        if (dict->entries[i].key && strcmp(dict->entries[i].key, k) == 0) {
-            free(owned);
-            *out_kind = dict->entries[i].value.kind;
-            return dict->entries[i].value.payload;
-        }
-    }
+    int32_t idx = dict_lookup(dict, k);
     free(owned);
+    if (idx >= 0) {
+        *out_kind = dict->entries[idx].value.kind;
+        return dict->entries[idx].value.payload;
+    }
     *out_kind = KIND_NONE;
     return 0;
 }
 
-void hyper_rt_dict_set(
-    int64_t dict_h,
-    int64_t key,
-    int64_t key_kind,
-    int64_t value,
-    int64_t val_kind
-) {
+void hyper_rt_dict_set(int64_t dict_h, int64_t key, int64_t key_kind, int64_t value, int64_t val_kind) {
     if (!dict_h) {
         return;
     }
@@ -552,24 +620,13 @@ void hyper_rt_dict_set(
         }
         k = owned;
     }
-    for (size_t i = 0; i < dict->len; i++) {
-        if (dict->entries[i].key && strcmp(dict->entries[i].key, k) == 0) {
-            free(owned);
-            free_rt_value(dict->entries[i].value);
-            dict->entries[i].value.kind = val_kind;
-            dict->entries[i].value.payload = value;
-            return;
-        }
-    }
-    if (dict->len + 1 > dict->cap) {
-        size_t ncap = dict->cap ? dict->cap * 2 : 4;
-        RtDictEntry *ne = (RtDictEntry *)realloc(dict->entries, ncap * sizeof(RtDictEntry));
-        if (!ne) {
-            free(owned);
-            return;
-        }
-        dict->entries = ne;
-        dict->cap = ncap;
+    int32_t idx = dict_lookup(dict, k);
+    if (idx >= 0) {
+        free(owned);
+        free_rt_value(dict->entries[idx].value);
+        dict->entries[idx].value.kind = val_kind;
+        dict->entries[idx].value.payload = value;
+        return;
     }
     /* Insert path still needs an owned key copy. */
     if (key_kind == KIND_STR) {
@@ -578,19 +635,22 @@ void hyper_rt_dict_set(
             return;
         }
     }
+    if (!dict_grow_entries(dict)) {
+        free(owned);
+        return;
+    }
     dict->entries[dict->len].key = owned;
     dict->entries[dict->len].value.kind = val_kind;
     dict->entries[dict->len].value.payload = value;
     dict->len += 1;
+    if (!dict_index_new_entry(dict)) {
+        dict->len -= 1;
+        free(owned);
+        dict->entries[dict->len].key = NULL;
+    }
 }
 
-int64_t hyper_rt_index_get(
-    int64_t obj,
-    int64_t obj_kind,
-    int64_t idx,
-    int64_t idx_kind,
-    int64_t *out_kind
-) {
+int64_t hyper_rt_index_get(int64_t obj, int64_t obj_kind, int64_t idx, int64_t idx_kind, int64_t *out_kind) {
     if (obj_kind == KIND_DICT) {
         return hyper_rt_dict_get(obj, idx, idx_kind, out_kind);
     }
@@ -603,14 +663,7 @@ int64_t hyper_rt_index_get(
     return 0;
 }
 
-void hyper_rt_index_set(
-    int64_t obj,
-    int64_t obj_kind,
-    int64_t idx,
-    int64_t idx_kind,
-    int64_t value,
-    int64_t val_kind
-) {
+void hyper_rt_index_set(int64_t obj, int64_t obj_kind, int64_t idx, int64_t idx_kind, int64_t value, int64_t val_kind) {
     if (obj_kind == KIND_DICT) {
         hyper_rt_dict_set(obj, idx, idx_kind, value, val_kind);
     } else if (obj_kind == KIND_LIST) {
@@ -836,15 +889,8 @@ static int values_equal(RtValue a, RtValue b) {
             return 0;
         }
         for (size_t i = 0; i < left->len; i++) {
-            int found = 0;
-            for (size_t j = 0; j < right->len; j++) {
-                if (strcmp(left->entries[i].key, right->entries[j].key) == 0 &&
-                    values_equal(left->entries[i].value, right->entries[j].value)) {
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) {
+            int32_t j = dict_lookup(right, dict_key_cstr(left->entries[i].key));
+            if (j < 0 || !values_equal(left->entries[i].value, right->entries[j].value)) {
                 return 0;
             }
         }

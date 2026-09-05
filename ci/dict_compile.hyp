@@ -1,0 +1,27 @@
+# Compile-path dict get/set: ≥256 keys, overwrite, insertion-order keys().
+# `{}` parses as an empty list, so seed a real dict literal.
+let mut d = {"seed": 1}
+let mut i = 0
+while i < 256:
+    d[i] = i * 2
+    i = i + 1
+
+print(d[0])
+print(d[255])
+print(d.len())
+
+d[128] = 1
+print(d[128])
+print(d["seed"])
+
+let mut sum = 0
+i = 0
+while i < 256:
+    sum = sum + d[i]
+    i = i + 1
+print(sum)
+
+let mut named = {"b": 1, "a": 2}
+named["b"] = 9
+print(named)
+print(named.keys())
